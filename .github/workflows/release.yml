@@ -1,0 +1,163 @@
+name: Release
+
+# Pushing a `v*` tag builds, signs, notarizes, publishes a GitHub Release, and bumps the Homebrew tap.
+# Running it manually (workflow_dispatch) only builds and uploads workflow artifacts: nothing is published.
+#
+# Secrets (in the `release` environment): MACOS_DEVELOPER_ID_P12, MACOS_DEVELOPER_ID_P12_PASSWORD,
+# MACOS_CI_KEYCHAIN_PASSWORD (optional), ASC_API_KEY_ID, ASC_API_ISSUER_ID, ASC_API_KEY_P8, HOMEBREW_TAP_TOKEN.
+# Variables: APPLE_TEAM_ID (ccode AB for now; switch to Nightshift Habits later, keep io.qualtive.cli).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to stamp into the dry-run build (no release is published)
+        required: true
+        default: 0.0.0-dryrun
+
+permissions:
+  contents: read
+
+env:
+  STATIC_SDK_URL: https://download.swift.org/swift-6.4.1-release/static-sdk/swift-6.4.1-RELEASE/swift-6.4.1-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz
+  STATIC_SDK_CHECKSUM: cef5592d7430ed3c5ae1ddda479849c6f5252bd94a5723db1559f984caf38a7c
+  SIGNING_IDENTIFIER: io.qualtive.cli
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux:
+    needs: version
+    runs-on: ubuntu-24.04
+    container: swift:6.4.1-noble
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Stamp version
+        run: scripts/stamp-version.sh "${{ needs.version.outputs.version }}"
+      - name: Install static Linux SDK
+        run: |
+          swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_CHECKSUM"
+          apt-get update -qq && apt-get install -y -qq file >/dev/null
+      - name: Build
+        run: swift build -c release --swift-sdk ${{ matrix.arch }}-swift-linux-musl --product qualtive -Xlinker -s
+      - name: Package
+        run: |
+          mkdir -p dist
+          name="qualtive-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}-musl"
+          cp "$(swift build -c release --swift-sdk ${{ matrix.arch }}-swift-linux-musl -Xlinker -s --show-bin-path)/qualtive" dist/qualtive
+          file dist/qualtive | grep -q "statically linked"
+          tar -C dist -czf "dist/$name.tar.gz" qualtive
+          rm dist/qualtive
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+
+  macos:
+    needs: version
+    runs-on: macos-26
+    environment: ${{ needs.version.outputs.publish == 'true' && 'release' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Stamp version
+        run: scripts/stamp-version.sh "${{ needs.version.outputs.version }}"
+      - name: Build universal binary
+        run: |
+          swift build -c release --arch arm64 --product qualtive
+          swift build -c release --arch x86_64 --product qualtive
+          mkdir -p dist
+          lipo -create -output dist/qualtive \
+            "$(swift build -c release --arch arm64 --show-bin-path)/qualtive" \
+            "$(swift build -c release --arch x86_64 --show-bin-path)/qualtive"
+          strip -x dist/qualtive
+          lipo -info dist/qualtive
+
+      - name: Sign and notarize
+        env:
+          P12: ${{ secrets.MACOS_DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_CI_KEYCHAIN_PASSWORD }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          PUBLISH: ${{ needs.version.outputs.publish }}
+        run: |
+          if [ -z "$P12" ] || [ -z "$ASC_API_KEY_P8" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            if [ "$PUBLISH" = "true" ]; then
+              echo "::error::Signing secrets are missing; refusing to publish an unsigned macOS binary."
+              exit 1
+            fi
+            echo "::warning::Signing secrets are missing; leaving the dry-run binary unsigned."
+            exit 0
+          fi
+          scripts/macos-sign-notarize.sh dist/qualtive
+
+      - name: Package
+        run: |
+          name="qualtive-${{ needs.version.outputs.version }}-macos-universal"
+          (cd dist && zip -q "$name.zip" qualtive && rm qualtive)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*.zip
+
+  publish:
+    needs: [version, linux, macos]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set; skipping the tap update."
+            exit 0
+          fi
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/nightshift-habits/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          scripts/homebrew-formula.sh "$VERSION" dist/SHA256SUMS > tap/Formula/qualtive.rb
+          cd tap
+          git config user.name "qualtive-release-bot"
+          git config user.email "release-bot@qualtive.io"
+          git add Formula/qualtive.rb
+          git commit -m "qualtive $VERSION"
+          git push
