@@ -139,6 +139,24 @@ import Testing
         }
     }
 
+    @Test func containerKeyDiscoversItsContainer() async throws {
+        let server = try await MockAPIServer { request in
+            request.path == "/containers" ? .json(#"[{"id":"acme"}]"#) : .json("[]")
+        }
+        defer { Task { await server.shutdown() } }
+
+        let session = try AuthSession(
+            environment: environment(["QUALTIVE_API_KEY": "c-key"]),
+            store: store,
+            apiURLOverride: server.url
+        )
+        _ = try await session.send(.GET, "/feedback/categories")
+        let requests = server.requests
+        #expect(requests.map(\.path) == ["/containers", "/feedback/categories"])
+        #expect(requests[0].headers.first(name: "X-Container") == nil)
+        #expect(requests[1].headers.first(name: "X-Container") == "acme")
+    }
+
     @Test func invalidGrantOnRefreshMeansNotAuthenticated() async throws {
         let server = try await MockAPIServer { _ in
             .json(#"{"error":"invalid_grant","error_description":"expired"}"#, status: .badRequest)

@@ -135,7 +135,7 @@ private final class CallbackHandler: ChannelInboundHandler, RemovableChannelHand
             return (.badRequest, Page.render(title: "Login failed", message: "The login response had no authorization code."))
         }
         promise.succeed(.init(code: code))
-        return (.ok, Page.render(title: "Logged in to Qualtive", message: "You can close this tab and return to the terminal."))
+        return (.ok, Page.render(title: "Qualtive CLI login", message: "Login received. You can close this tab and return to the terminal."))
     }
 
     private func respond(context: ChannelHandlerContext, status: HTTPResponseStatus, html: String) {

@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SWIFT_VERSION: "6.4.1"
+  STATIC_SDK_URL: https://download.swift.org/swift-6.4.1-release/static-sdk/swift-6.4.1-RELEASE/swift-6.4.1-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz
+  STATIC_SDK_CHECKSUM: cef5592d7430ed3c5ae1ddda479849c6f5252bd94a5723db1559f984caf38a7c
+
+jobs:
+  linux:
+    name: Linux (test + static musl build)
+    runs-on: ubuntu-24.04
+    container: swift:6.4.1-noble
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: linux-spm-${{ hashFiles('Package.resolved') }}
+          restore-keys: linux-spm-
+
+      - name: Test
+        run: swift test
+
+      - name: Install static Linux SDK
+        run: swift sdk install "$STATIC_SDK_URL" --checksum "$STATIC_SDK_CHECKSUM"
+
+      - name: Build static binary
+        run: swift build -c release --swift-sdk x86_64-swift-linux-musl --product qualtive
+
+      - name: Check static binary
+        run: |
+          bin="$(swift build -c release --swift-sdk x86_64-swift-linux-musl --show-bin-path)/qualtive"
+          apt-get update -qq && apt-get install -y -qq file >/dev/null
+          file "$bin"
+          file "$bin" | grep -q "statically linked"
+          "$bin" version
+          "$bin" --help
+
+  macos:
+    name: macOS (test + universal build)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Test
+        run: swift test
+
+      - name: Build universal binary
+        run: |
+          swift build -c release --arch arm64 --product qualtive
+          swift build -c release --arch x86_64 --product qualtive
+          lipo -create -output qualtive \
+            "$(swift build -c release --arch arm64 --show-bin-path)/qualtive" \
+            "$(swift build -c release --arch x86_64 --show-bin-path)/qualtive"
+          lipo -info qualtive
+          ./qualtive version

@@ -86,7 +86,7 @@ public actor AuthSession {
             let token = try await validBearerToken(forceRefresh: forceRefresh)
             var headers = [("Authorization", "Bearer \(token)")]
             if includeContainer {
-                guard let container else {
+                guard let container = try await containerResolvingKeyContainer(token: token) else {
                     throw CLIError(
                         "No container selected.",
                         hint: "Pass --container <id> or run `qualtive containers use <id>`.",
@@ -160,6 +160,17 @@ public actor AuthSession {
         try store.save(current, profile: profile)
         credentials = current
         return current
+    }
+
+    /// `c-` container keys belong to exactly one container, which `GET /containers` returns without `X-Container`.
+    private func containerResolvingKeyContainer(token: String) async throws -> String? {
+        if let container { return container }
+        guard credentials?.kind == .apiKey, token.hasPrefix("c-") else { return nil }
+        let response = try await client.send(.GET, "/containers", headers: [("Authorization", "Bearer \(token)")])
+        let containers = try response.decode([Container].self)
+        guard containers.count == 1 else { return nil }
+        credentials?.container = containers[0].id
+        return containers[0].id
     }
 
     private var activeCredentials: StoredCredentials? {
